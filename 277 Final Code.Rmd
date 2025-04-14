@@ -1,0 +1,932 @@
+---
+title: "GARCH_KF"
+output: html_document
+date: "2025-03-10"
+---
+
+
+
+```{r}
+# install.packages("MASS")
+# install.packages("ggplot")
+library(MASS)
+library(ggplot2)
+library(tibble)
+library(rugarch)
+```
+
+# Functions
+
+
+```{r}
+basis <- function(x, degree, i, knots){
+  if(degree == 0){
+    B <- ifelse((x>=knots[i])&(x<knots[i+1]),1,0)
+  } else {
+    if((knots[degree + i] - knots[i]) == 0){
+      if(x != knots[i+degree]){
+        alpha1 <- 0
+      } else {
+        return(1)
+      }
+    } else {
+      alpha1 <- (x-knots[i])/(knots[degree+i] - knots[i])
+    }
+    if((knots[i+degree+1] - knots[i+1]) == 0){
+      if(x != knots[i+degree]){
+        alpha2 <- 0
+      } else {
+        return(1)
+      }
+    } else {
+      alpha2 <- (knots[i+degree+1] - x) / (knots[i+degree+1] - knots[i+1])
+    }
+    B <- alpha1 * basis(x, (degree-1), i, knots) + 
+      alpha2*basis(x, (degree-1), (i+1), knots)
+  }
+  return(B)
+}
+```
+
+Construct the matrix $\mathbf{B}$, column by column. Matrix $B$ contains the basis functions computed through the Cox-deBoor recursive formulas using the function defined in the codechunk above, evaluated at different times to maturity (rows) and at different knot intervals (columns). For more details, check FURM on canvas.
+
+```{r}
+matrix_b <- function(x, degree=3, int_knots) { 
+  # the x argument takes in a vector of time values that 
+  # will be used to evaluate a design matrix of basis functions 
+  # the degree argument specifies the highest degree of polynomials for
+  # the basis functions
+  # the int_knots argument takes in a vector of knots that will be used 
+  # to determine the intervals of the piecewise function
+  bound_knots <- int_knots[c(1, length(int_knots))] # this line creates bound knots
+  knots <- c(rep(bound_knots[1], (degree+1)), int_knots[c(-1, -length(int_knots))], rep(bound_knots[2], (degree+1)))
+  # the line above adds a couple of extra knots to each end of the int_knots vector because of the Cox-deBoor recursion
+  K <- length(int_knots) + degree - 1 # number of columns in the Basis matrix
+  B.mat <- matrix(0,nrow = length(x), ncol = K) # initialize the matrix
+  for(j in 1:K) {
+    B.mat[,j] <- sapply(X = x, FUN = basis, degree = degree, i = j, knots = knots) # add each column, one by one
+  }
+  return(B.mat) # return the matrix
+}
+```
+
+
+```{r}
+interp_yc <- function(yield_list, int_knots, degree = 3, d, last_tenor){
+  # yield_list: parameter of the form of a list of data frames containing ZCB spot rate
+  # int knots: the interior knots used for b-spline construction
+  # degree: highest degree of polynomials for the basis functions
+  # d: the date chosen to interpolate from the list
+  # last_tenor: last tenor to interpolate in a day
+  yield_list[[d]] <- data.frame(Maturity = yield_list[[d]]$Maturity,
+                                ZERO_YLD1 = yield_list[[d]]$ZERO_YLD1)
+  yc_df_pre <- rbind(data.frame(Maturity = 0, ZERO_YLD1 = 0), na.omit(yield_list[[d]]))
+  last_row <- which(round(yc_df_pre$Maturity,3) == last_tenor)
+  yc_df <- yc_df_pre[1:last_row,]
+  yields <- c(0, yc_df$ZERO_YLD1)
+  maturities <- c(0, as.numeric(yc_df$Maturity))
+  x <- as.numeric(maturities) # maturity dates
+  B <- matrix_b(x, degree=degree, int_knots = int_knots) 
+  B_t_B <- t(B) %*% B
+  # B is the design matrix on which the least squares coefficients will be calculated
+  
+  alphas <- solve(B_t_B) %*% t(B) %*% yields # OLS Formula for coefficients
+  x2 <- seq(1/12, last_tenor, 1/12) # this range is used to simulate a continuous yield curve
+  B2 <- matrix_b(x2, degree = degree, int_knots = int_knots) 
+  # B2 is the matrix of basis functions but evaluated at a 'continuous' time (not really but close enough)
+  
+  interpolated_yields <- data.frame(Maturity = x2, ZERO_YLD1 = B2 %*% alphas) # create dataframes for plotting
+  og_yields <- data.frame(ttm = maturities, yield = yields)
+
+  return(interpolated_yields)
+}
+```
+
+Interpolate a list of data with different dates.
+
+```{r}
+interpolate_list <- function(yield_list, start, T_, degree = 3){
+  # yield_list: Parameter of the form of a list of data frames containing ZCB spot rate
+  # start: starting date from the yield_list list
+  # T_: length of time window
+  # degree: highest degree of polynomials for the basis functions
+  interpolated_yc <- list()
+  k <- 1
+  for(i in start:(start + T_ - 1)){
+    lt_max <- max(yield_list[[i]]$Maturity) # This line of code basically chops all yields beyond 20
+    avail_ylds <- na.omit(yield_list[[i]]$ZERO_YLD1)
+    maturities <- yield_list[[i]]$Maturity
+    N <- length(avail_ylds)
+    if(N %in% c(5, 6)){
+      int_knots <- c(0, quantile(maturities, probs = c(0, 0.5, 1)))
+    } else if(N %in% c(7,8,9)){
+      int_knots <- c(0,quantile(maturities, probs = c(0, 0.33, 0.66, 1)))
+    } else if(N %in% 10:15){
+      int_knots <- c(0,quantile(maturities, probs = c(0, 0.25, 0.5, .75, 1)))
+    } else {
+      int_knots <- c(0,quantile(maturities, probs = c(0, 0.20, 0.4, .6, .8, 1)))
+    }
+    interpolated_yc[[k]] <- interp_yc(yield_list = yield_list,
+                                      int_knots = int_knots,
+                                      d = i,
+                                      last_tenor = lt_max,
+                                      degree = degree)[3:240,]
+    k <- k + 1
+  }
+  return(interpolated_yc)
+}
+```
+
+Kalman Filter basis calculation 
+```{r}
+NS_loading <- function(lambda, mats) {
+  loading <- rbind(rep(1, length(mats)),
+                   (1 - exp(-lambda*mats)) / (lambda*mats),
+                   (1 - exp(-lambda*mats)) / (lambda*mats) - exp(-lambda*mats))
+  return(loading)
+}
+```
+
+
+Standard Kalman Filter
+```{r}
+KF_NS <- function(par, yt, mats, lam) {
+  # Standard Kalman Filter for Nelson Siegel model
+  # Model:
+  #   y_t = d_t + F_t' x_t + f_t + v_t, v_t ~ N(0, V), observation equation
+  #   x_t = c + G x_{t-1} + w_t, w_t ~ N(0, W), state equation
+  #   f_t = b*t + beta*cos(2*pi*t*dt) + eta*sin(2*pi*t*dt), seasonal effect
+  # Inputs:
+  #   par: a vector of parameters
+  #   yt: the logarihm of futures prices
+  #   T: maturities
+  #   delivery_time: a vector of date, which is necessary if seasonality is "Constant"
+  #   dt: delta t
+  #   smoothing: a boolean variable indicate if Kalman Smoothing is required
+  #   seasonality: "Constant" or "None"
+  # Outputs:
+  #   nll: the negative log likelihood
+  #   ll_table: a vector to store cumulative log-likelihood at each time point - used to calculate Sandwich variance
+  #   table_at_filter: a nT*2 matrix gives the filtered values of state variables.
+  #   table_at_prediction: a (nT+1)*2 matrix gives the predicted values of state variables.
+  #   table_at_smoother: a nT*2 matrix gives the smoothed values of state variables. The algorithm of Kalman Smoother is given by Bierman (1973) and De Jong (1989).
+  #   ft: seasonal effect
+
+ # require(lubridate)
+
+  n_obs <- dim(yt)[1]
+  n_contract <- dim(yt)[2]
+
+  table_xt_filter <- matrix(0, nrow = n_obs, ncol = 3) # a_t|t
+  table_Pt_filter <- array(0, dim = c(3, 3, n_obs)) # P_t|t
+  table_xt_prediction <- matrix(0, nrow = n_obs+1, ncol = 3) # a_t|t-1
+  table_Pt_prediction <- array(0, dim = c(3, 3, n_obs+1)) # P_t|t-1
+  
+  nll <- 0 # negative log-likelihood
+  ll_table <- matrix(0, nrow = 1, ncol = n_obs) # table of log-likelihood
+
+  table_et <- matrix(0, nrow = n_obs, ncol = n_contract) # e_t
+  table_L <- array(0, dim = c(n_contract, n_contract, n_obs)) # Covariance of y
+  table_y <- matrix(0, nrow = n_obs, ncol = n_contract) # y_hat
+
+  # Parameters
+  if (length(par) != 9+n_contract) {
+    stop("Incorrect number of parameters. ")
+  }
+
+  phi0 <- c(par[1], par[2], par[3])
+  phi1 <- diag(c(par[4], par[5], par[6]))
+  x0 <- phi0 / (1 - diag(phi1))
+  #lam <- par[7]
+  sigma_w <- diag( par[7:9] )
+  sigma_v <- diag( par[10: length(par)] )
+  
+  # Initialization
+  xt_filter <- x0
+  Pt_filter <- diag( diag(sigma_w) / (1 - diag(phi1)^2) )
+
+  # Kalman Filter
+  for (i in 1:n_obs) {
+    lambda <- rbind(rep(1, n_contract),
+                    (1 - exp(-lam * mats[i,])) / (lam * mats[i,]),
+                    (1 - exp(-lam * mats[i,])) / (lam * mats[i,]) - exp(-lam * mats[i,]))
+
+    # Prediction step
+    xt_prediction  <- phi0 + phi1 %*% xt_filter # a_t+1|t
+    Pt_prediction <- phi1 %*% Pt_filter %*% t(phi1) + sigma_w # P_t+1|t
+    y_prediction <- t(lambda) %*% xt_prediction # ytilde_t|t-1 = d_t + F_t a_t|t-1
+
+    # Filter step
+    et <- yt[i, ] - t(y_prediction) # e_t = y_t - ytilde_t|t-1
+    L <- t(lambda) %*% Pt_prediction %*% lambda + sigma_v # Covariance matrix of et
+    invL <- solve(L) # inverse of L
+    K <- Pt_prediction %*% lambda %*% invL # Kalman gain matrix: K_t
+
+    xt_filter <- xt_prediction + K %*% t(et) # a_t
+    Pt_filter <- (diag(3) - K %*% t(lambda)) %*% Pt_prediction # P_t
+    #Pt_filter <- (diag(3) - K %*% t(lambda)) %*% Pt_prediction %*% t(diag(3) - K %*% t(lambda)) + K %*% sigma_v %*% t(K)
+
+    # Update tables
+    table_xt_filter[i, ] <- t(xt_filter)
+    table_Pt_filter[, , i] <- Pt_filter
+    table_xt_prediction[i+1, ] <- t(xt_prediction)
+    table_Pt_prediction[, , i+1] <- Pt_prediction
+    table_et[i, ] <- et
+    table_L[, , i] <- L
+    table_y[i, ] <- y_prediction
+
+    if (det(L)<0) {
+      message(i)
+      message("matrix is not semi positive definite (KF)")
+    }
+
+    # Update likelihood
+    nll <- nll + 0.5*log(det(L)) + 0.5*et %*% solve(L) %*% t(et)
+    ll_table[i] <- -(0.5*length(yt[i, ])*log(2*pi) + 0.5*log(det(L)) + 0.5*et %*% solve(L) %*% t(et))
+  }
+
+  return(list(nll = nll,
+              ll_table = ll_table,
+              xt_filter = table_xt_filter,
+              Pt_filter = table_Pt_filter,
+              xt_prediction = table_xt_prediction,
+              cov_y = table_L,
+              y_hat = table_y))
+}
+
+
+```
+
+
+Kalman Filter with GARCH
+```{r}
+KF_NS_GARCH <- function(par, yt, mats, lam, volatility_array) {
+  # Standard Kalman Filter for Nelson Siegel model
+  # Model:
+  #   y_t = d_t + F_t' x_t + f_t + v_t, v_t ~ N(0, V), observation equation
+  #   x_t = c + G x_{t-1} + w_t, w_t ~ N(0, W), state equation
+  #   f_t = b*t + beta*cos(2*pi*t*dt) + eta*sin(2*pi*t*dt), seasonal effect
+  # Inputs:
+  #   par: a vector of parameters
+  #   yt: the logarihm of futures prices
+  #   T: maturities
+  #   delivery_time: a vector of date, which is necessary if seasonality is "Constant"
+  #   dt: delta t
+  #   smoothing: a boolean variable indicate if Kalman Smoothing is required
+  #   seasonality: "Constant" or "None"
+  #   volatility_array: the array of Q_t covariance matrix fitted by rugarch ( input the array for simplicity, we could also use the GARCH paramter for for state covariance update)
+  # Outputs:
+  #   nll: the negative log likelihood
+  #   ll_table: a vector to store cumulative log-likelihood at each time point - used to calculate Sandwich variance
+  #   table_at_filter: a nT*2 matrix gives the filtered values of state variables.
+  #   table_at_prediction: a (nT+1)*2 matrix gives the predicted values of state variables.
+  #   table_at_smoother: a nT*2 matrix gives the smoothed values of state variables. The algorithm of Kalman Smoother is given by Bierman (1973) and De Jong (1989).
+  #   ft: seasonal effect
+  
+ # require(lubridate)
+
+  n_obs <- dim(yt)[1]
+  n_contract <- dim(yt)[2]
+
+  table_xt_filter <- matrix(0, nrow = n_obs, ncol = 3) # a_t|t
+  table_Pt_filter <- array(0, dim = c(3, 3, n_obs)) # P_t|t
+  table_xt_prediction <- matrix(0, nrow = n_obs+1, ncol = 3) # a_t|t-1
+  table_Pt_prediction <- array(0, dim = c(3, 3, n_obs+1)) # P_t|t-1
+
+  nll <- 0 # negative log-likelihood
+  ll_table <- matrix(0, nrow = 1, ncol = n_obs) # table of log-likelihood
+
+  table_et <- matrix(0, nrow = n_obs, ncol = n_contract) # e_t
+  table_L <- array(0, dim = c(n_contract, n_contract, n_obs)) # Covariance of y
+  table_y <- matrix(0, nrow = n_obs, ncol = n_contract) # y_hat
+
+  # Parameters
+  if (length(par) != 9+n_contract) {
+    stop("Incorrect number of parameters. ")
+  }
+
+  phi0 <- c(par[1], par[2], par[3])
+  phi1 <- diag(c(par[4], par[5], par[6]))
+  x0 <- phi0 / (1 - diag(phi1))
+  #lam <- par[7]
+  sigma_w <- diag( par[7:9] )
+  sigma_v <- diag( par[10: length(par)] )
+
+  # Initialization
+  xt_filter <- x0
+  Pt_filter <- diag( diag(sigma_w) / (1 - diag(phi1)^2) )
+
+  # Kalman Filter
+  for (i in 1:n_obs) {
+    lambda <- rbind(rep(1, n_contract),
+                    (1 - exp(-lam * mats[i,])) / (lam * mats[i,]),
+                    (1 - exp(-lam * mats[i,])) / (lam * mats[i,]) - exp(-lam * mats[i,]))
+    sigma_w <- volatility_array[,,i]
+    
+    # Prediction step
+    xt_prediction  <- phi0 + phi1 %*% xt_filter # a_t+1|t
+    Pt_prediction <- phi1 %*% Pt_filter %*% t(phi1) + sigma_w # P_t+1|t
+    y_prediction <- t(lambda) %*% xt_prediction # ytilde_t|t-1 = d_t + F_t a_t|t-1
+    
+    # Filter step
+    
+    et <- yt[i, ] - t(y_prediction) # e_t = y_t - ytilde_t|t-1
+    L <- t(lambda) %*% Pt_prediction %*% lambda + sigma_v # Covariance matrix of et
+    invL <- solve(L) # inverse of L
+    K <- Pt_prediction %*% lambda %*% invL # Kalman gain matrix: K_t
+    
+    xt_filter <- xt_prediction + K %*% t(et) # a_t
+    Pt_filter <- (diag(3) - K %*% t(lambda)) %*% Pt_prediction # P_t
+    #Pt_filter <- (diag(3) - K %*% t(lambda)) %*% Pt_prediction %*% t(diag(3) - K %*% t(lambda)) + K %*% sigma_v %*% t(K)
+
+    # Update tables
+    table_xt_filter[i, ] <- t(xt_filter)
+    table_Pt_filter[, , i] <- Pt_filter
+    table_xt_prediction[i+1, ] <- t(xt_prediction)
+    table_Pt_prediction[, , i+1] <- Pt_prediction
+    table_et[i, ] <- et
+    table_L[, , i] <- L
+    table_y[i, ] <- y_prediction
+
+
+    if (det(L)<0) {
+      message(i)
+      message("matrix is not semi positive definite (KF)")
+    }
+
+    # Update likelihood
+    nll <- nll + 0.5*log(det(L)) + 0.5*et %*% solve(L) %*% t(et)
+    ll_table[i] <- -(0.5*length(yt[i, ])*log(2*pi) + 0.5*log(det(L)) + 0.5*et %*% solve(L) %*% t(et))
+  }
+  
+  
+
+  return(list(nll = nll,
+              ll_table = ll_table,
+              xt_filter = table_xt_filter,
+              Pt_filter = table_Pt_filter,
+              xt_prediction = table_xt_prediction,
+              cov_y = table_L,
+              y_hat = table_y))
+}
+
+
+
+```
+
+
+Yule-Walker Estimate for AR(1)
+```{r}
+yule_walker_ar1 <- function(ts) {
+  # Estimates the parameters of an AR(1) process using the Yule-Walker equations.
+  #
+  # Parameters:
+  # ts: A univariate time series (numeric vector).
+  #
+  # Returns:
+  # A list containing:
+  #   phi: The estimated autoregressive coefficient.
+  #   sigma2: The estimated variance of the innovations.
+  #   c: The estimated intercept term.
+
+  # Compute the sample mean (used for centering the time series)
+  mu <- mean(ts)
+  
+  # Center the time series
+  ts_centered <- ts - mu
+  
+  # Compute the autocovariance at lag 0 and lag 1
+  gamma0 <- var(ts_centered) * (length(ts_centered) - 1) / length(ts_centered)
+  gamma1 <- sum(ts_centered[-1] * ts_centered[-length(ts_centered)]) / length(ts_centered)
+  
+  # Estimate phi using the Yule-Walker equation
+  phi <- gamma1 / gamma0
+  
+  # Estimate the intercept c
+  c <- mu * (1 - phi)
+  
+  # Estimate the innovation variance sigma2
+  sigma2 <- gamma0 * (1 - phi^2)
+  
+  # Return the estimates
+  return(list(phi = phi, sigma2 = sigma2, c = c))
+}
+
+```
+
+OLS for Nelson Siegel
+```{r}
+fit_nelson_siegel <- function(yield_list, lambda, start, tenors, T_){
+  # yield_list: Parameter of the form of a list of data frames containing ZCB spot rate
+  # lambda: Individual lambda parameter for NS
+  # start: starting date from the yield_list list
+  # tenors: list of time to maturities
+  # T_: length of time window
+
+  indices <- which(round(yield_list[[start]]$Maturity, 2) %in% round(tenors, 2))
+  maturities <- yield_list[[1]]$Maturity[indices]
+  N <- length(maturities)
+  
+  term1 <- 1
+  term2 <- (1 - exp(-maturities*lambda)) / (maturities*lambda)
+  term3 <- ((1 - exp(-maturities*lambda)) / (maturities*lambda)) - exp(-maturities*lambda)
+  Phi <- cbind(term1, term2, term3) # Construct Phi matrix for NS
+  
+  Y_mat <- matrix(0, nrow = N, # matrix of N by T, containing yields for each tenor (columns)
+                  ncol = T_) # where each column represents a different date
+  j <- 1
+  for(t in start:(start + T_- 1)){
+    Y_mat[,j] <- yield_list[[t]]$ZERO_YLD1[indices]
+    j <- j + 1
+    phitphi_1phit <- solve(t(Phi) %*% Phi, t(Phi)) # OLS for the coefficients for every single day
+    betas_t <- phitphi_1phit %*% Y_mat  
+    betas <- rowSums(betas_t) / T_ # average all coefficients
+    eps <- matrix(0, nrow = N, ncol = T_) # matrix of errors for each day (column) and each tenor (row)
+    for(t in 1:T_){
+      eps[,t] <- Y_mat[,t] - Phi %*% betas # Populate errors
+    }
+    sig_hat2 <- sum(as.vector(eps)^2) / (N * T_ - 3) # take mean squared error (MLE Estimator)
+  }
+
+  return(list(betas = betas, # fitted betas static: 1*3   dynamic: T*3
+              sigma2 = sig_hat2, # MSE
+              lambda = lambda, # lambda(input)
+              cov_mat_betas = sig_hat2 * solve(t(Phi) %*% Phi), # Nelson Siegel design matrix N*3
+              eps = eps,
+              Phi = Phi)) # residuals N*T
+  
+}
+```
+
+
+
+
+
+
+
+
+# Data Processing
+
+Import data and we only take the last 300 days
+```{r}
+clean_yield_raw <-read.csv("./Clean_Yields.csv")
+maturity_clean <- as.vector(c(1/12, 1/4, 1/2, 1, 2, 3, 5, 7, 10, 20, 30))
+clean_yield_raw <- na.omit(as.matrix(clean_yield_raw))
+st_louis_Fed_yields <- list()
+
+for(i in 1:nrow(clean_yield_raw)){
+  one_date_matrix <- tibble(
+    Maturity = maturity_clean,
+    ZERO_YLD1 = as.numeric(clean_yield_raw[i,2:12 ]),
+    START_DT = format(as.Date(clean_yield_raw[i,1], format="%Y-%m-%d"), "%Y%m%d")
+  )
+  one_date_matrix <- na.omit(one_date_matrix)
+
+  st_louis_Fed_yields[[i]] <- one_date_matrix
+}
+
+head(st_louis_Fed_yields)
+```
+
+Interpolate Data
+```{r}
+data_list_300 <- st_louis_Fed_yields[c((length(st_louis_Fed_yields) - 299):length(st_louis_Fed_yields))]
+interp252 <- interpolate_list(data_list_300, 1, 300) # only take the first 100 dates
+
+```
+
+Prepared the interpolated data to matrix form.
+```{r}
+tenors = c(1/12, 5, 10, 15, 20)
+n_matrices <- length(interp252)
+n_tenors <- length(tenors)
+
+training_data <- matrix(NA, nrow = n_matrices, ncol = n_tenors)
+colnames(training_data) <- tenors  
+
+# Iterate through each matrix in the list
+for (i in 1:n_matrices) {
+  mat <- interp252[[i]] 
+
+# Match tenors to the closest Maturity column values
+# Find the index of the closest maturity (I did this beaause somtimes 0.8333 ! = 1/12 in the interpolate data)
+matched_values <- sapply(tenors, function(tenor) {
+  rounded_maturity <- round(mat[, 1], 2) 
+  rounded_tenor <- round(tenor, 2)
+
+  idx <- which.min(abs(rounded_maturity - rounded_tenor))
+  
+  if (length(idx) > 0) {
+    return(mat[idx, 2]) 
+  } else {
+    return(NA) 
+  }
+})
+  
+  training_data[i, ] <- matched_values  # Store extracted values
+}
+
+
+head(training_data)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+# Paramter Estimation and Model Fitting 
+
+
+Fit the latent state paramter (L, S, C) by OLS
+```{r}
+tsBetas <- matrix(NA, nrow = 3, ncol = 300) # state parameter estimate using OLC
+obs_res <- matrix(NA, nrow = , ncol = 300) # residual of observation
+for(i in 1:300) {
+  ols_fit <- fit_nelson_siegel(interp252, 0.1, tenors = c(1/12, 5, 10, 15, 20), start = i, T_ = 1)
+  tsBetas[,i] <- ols_fit$betas
+  obs_res[,i] <- ols_fit$sigma2
+}
+```
+
+
+The state transition matri A, the output are 3 diagonal term.
+```{r}
+AR1_level <- yule_walker_ar1(tsBetas[1,])
+AR1_slope <- yule_walker_ar1(tsBetas[2,])
+AR1_curv <- yule_walker_ar1(tsBetas[3,])
+
+AR1_level
+AR1_slope
+AR1_curv
+```
+
+
+
+
+
+Fit a standard KF using the paramters A, Q, R.
+```{r}
+sigOLS2 <- mean(obs_res) # R: covariance matrix of observation noise (assumed to be diagonal)
+tenors <- c(1/12, 5, 10, 15, 20) # tenor of each time
+mats_matrix_real <- matrix(rep(tenors, each = 300), nrow = 300, byrow = TRUE)
+
+
+parameters <- c(AR1_level$c, AR1_slope$c, AR1_curv$c, AR1_level$phi, AR1_slope$phi, AR1_curv$phi, AR1_level$sigma2, AR1_slope$sigma2,
+            AR1_curv$sigma2, rep(sigOLS2, length(tenors)))
+
+real_result<- KF_NS(parameters, training_data, mats_matrix_real, 0.1)
+head(real_result$y_hat) # kalman filter prediction for yield data
+
+```
+
+
+Use the standard Kalman Filter get the predicted state estimated and the filtered state. We get the residual for GARCH(1,1) model fitting.
+```{r}
+filtered_x <- real_result$xt_filter
+predicted_x <- real_result$xt_prediction[-301,]
+
+
+Beta_res <- filtered_x - predicted_x
+
+```
+
+Use the state residual to fit the GARCH(1,1) model.
+```{r}
+garch_spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(0, 0), include.mean = TRUE),
+  distribution.model = "norm"  # Normal distribution for residuals
+)
+
+garch_beta_1 <- ugarchfit(spec = garch_spec, data = Beta_res[,1])
+garch_beta_2 <- ugarchfit(spec = garch_spec, data = Beta_res[,2])
+garch_beta_3 <- ugarchfit(spec = garch_spec, data = Beta_res[,3])
+
+garch_beta_1
+garch_beta_2
+garch_beta_3
+
+
+beta_1_fit <- garch_beta_1@fit$coef
+beta_2_fit <- garch_beta_2@fit$coef
+beta_3_fit <- garch_beta_3@fit$coef
+
+
+vol_param <- rbind(beta_1_fit[2:4], beta_2_fit[2:4], beta_3_fit[2:4])
+vol_param # parameters for volatility
+```
+
+Get the predicted volatility in to data frame.
+```{r}
+# Extract conditional volatility for each time t
+volatility_beta_1 <- sigma(garch_beta_1)
+volatility_beta_2 <- sigma(garch_beta_2)
+volatility_beta_3 <- sigma(garch_beta_3)
+
+# Combine into a data frame
+volatility_df <- data.frame(
+  Time = 1:length(volatility_beta_1),  # Assuming all series have the same length
+  Volatility_Beta_1 = volatility_beta_1,
+  Volatility_Beta_2 = volatility_beta_2,
+  Volatility_Beta_3 = volatility_beta_3
+)
+
+# View the volatility time series
+head(volatility_df)  # Show the first few rows
+
+```
+
+
+Convert the Q_t matrix over time into array, which is T number of 3*3 matrices. 
+For inputnig Q_t at once to the function, this may not be a good choice for prediction, but it is efficient if we want to see the tracking.
+For prediction, we need to input the volatility paramters $\omega$, $\alpha_1$, $\beta1$ for 1 step aheadprediction. 
+```{r}
+
+
+T_ <- length(volatility_beta_1)
+volatility_array <- array(0, dim = c(3, 3, 300))
+for (t in 1:300) {
+  volatility_array[,,t] <- matrix( c(as.numeric(volatility_beta_1[t]),0,0,0, as.numeric(volatility_beta_2[t]),0,0,0, as.numeric(volatility_beta_3[t])), 3, 3 )
+}
+
+
+volatility_array[,,1:5]
+
+```
+
+Fit a KF-GARCH model.
+```{r}
+KF_G_res<-KF_NS_GARCH(parameters, training_data, mats_matrix_real, 0.1, volatility_array = volatility_array)
+```
+
+
+
+
+
+
+
+# Model result and Comparison
+
+
+Compare the prediction values of the lastest 5 days and log-likelihhod function of the fit.
+```{r}
+tail(KF_G_res$y_hat)
+tail(real_result$y_hat)
+
+
+cat("Log Likelihood of Kalman Filter:", real_result$nll,"\n")
+cat("Log Likelihood of Kalman Filter-Garch:", KF_G_res$nll)
+```
+
+
+
+Plot for standard KF
+```{r}
+# Extract y_hat (KF predictions) and real interpolated data
+y_hat <- real_result$y_hat  # Predicted values from KF
+y_real <- training_data  # Real interpolated data
+
+# Extract covariance matrix of y for confidence intervals
+y_cov <- real_result$cov_y  # Covariance matrices for each time step
+
+# Compute 95% confidence interval
+n_obs <- nrow(y_hat)
+n_contract <- ncol(y_hat)
+
+# Initialize matrices for upper and lower bounds
+ci_upper <- matrix(NA, n_obs, n_contract)
+ci_lower <- matrix(NA, n_obs, n_contract)
+
+for (i in 1:n_obs) {
+  std_err <- sqrt(diag(y_cov[,,i]))  # Extract standard deviation for each tenor
+  ci_upper[i, ] <- y_hat[i, ] + 1.96 * std_err  # Upper bound
+  ci_lower[i, ] <- y_hat[i, ] - 1.96 * std_err  # Lower bound
+}
+
+# Convert to a data frame for ggplot (taking the first tenor as an example)
+df <- data.frame(
+  Time = 1:n_obs, 
+  Real = y_real[, 2],  # Taking the first tenor as an example
+  Predicted = y_hat[, 2],
+  CI_Upper = ci_upper[, 2],
+  CI_Lower = ci_lower[, 2]
+)
+
+df <- data.frame(
+  Time = 1:n_obs, 
+  Real = y_real[, 3],  
+  Predicted = y_hat[, 3],
+  CI_Upper = ci_upper[, 3],
+  CI_Lower = ci_lower[, 3]
+)
+
+
+# loop to genrate plot for slong 5 different maturities
+for (i in 2:5) {
+  df <- data.frame(
+    Time = 1:n_obs, 
+    Real = y_real[, i],  
+    Predicted = y_hat[, i],
+    CI_Upper = ci_upper[, i],
+    CI_Lower = ci_lower[, i]
+  )
+  
+  plot <- ggplot(df, aes(x = Time)) +
+    geom_line(aes(y = Real, color = "Real Data"), size = 1) +
+    geom_line(aes(y = Predicted, color = "Predicted Data"), size = 1, linetype = "dashed") +
+    geom_ribbon(aes(ymin = CI_Lower, ymax = CI_Upper), fill = "blue", alpha = 0.2) +  
+    labs(title = paste("Kalman Filter Prediction vs Real Data - Tenor", i),
+         y = paste("Yield (Tenor", i, ")"),
+         x = "Time") +
+    scale_color_manual(values = c("Real Data" = "black", "Predicted Data" = "red", "Predicted 95% Confidence Interval" = "blue")) +
+    theme_minimal()
+  
+  print(plot)
+}
+
+
+```
+
+
+
+Plot for KF-GARCH
+```{r}
+y_hat <- KF_G_res$y_hat  # Predicted values from KF
+y_real <- training_data  # Real interpolated data
+
+y_cov <- KF_G_res$cov_y
+
+n_obs <- nrow(y_hat)
+n_contract <- ncol(y_hat)
+
+# Initialize matrices for upper and lower bounds
+ci_upper <- matrix(NA, n_obs, n_contract)
+ci_lower <- matrix(NA, n_obs, n_contract)
+
+for (i in 1:n_obs) {
+  std_err <- sqrt(diag(y_cov[,,i]))
+  ci_upper[i, ] <- y_hat[i, ] + 1.96 * std_err  # Upper bound of KF-GARCH
+  ci_lower[i, ] <- y_hat[i, ] - 1.96 * std_err  # Lower bound of KF-GARCH
+}
+
+tenors <- c("1/12 year", "5-Year", "10-Year", "20-Year", "30-Year")
+
+# loop to genrate plot for slong 5 different maturities
+for (i in 2:5) { 
+  df <- data.frame(
+    Time = 1:n_obs, 
+    Real = y_real[, i],  
+    Predicted = y_hat[, i],
+    CI_Upper = ci_upper[, i],
+    CI_Lower = ci_lower[, i]
+  )
+
+  plot <- ggplot(df, aes(x = Time)) +
+    geom_line(aes(y = Real, color = "Real Data"), size = 1) +
+    geom_line(aes(y = Predicted, color = "Predicted Data"), size = 1, linetype = "dashed") +
+    geom_ribbon(aes(ymin = CI_Lower, ymax = CI_Upper), fill = "blue", alpha = 0.2) +  
+    labs(title = paste("GARCH Kalman Filter Prediction vs Real Data -", tenors[i]),
+         y = paste("Yield (", tenors[i], ")"),
+         x = "Time") +
+    scale_color_manual(values = c("Real Data" = "black", "Predicted Data" = "red", "Predicted 95% Confidence Interval" = "blue")) +
+    theme_minimal()
+  
+  print(plot) 
+}
+```
+
+
+Comparison of KF and KF-GARCH yield rate prediction and true yield rate
+```{r}
+
+tenor <- c("1 Month", "5 Years", "10 Years", "20 Years", "30 Years")
+
+# loop to genrate plot for slong 5 different maturities
+for (tenor_index in 2:5) {
+  
+  df <- data.frame(
+    Time = 1:n_obs, 
+    Real = y_real[, tenor_index],  
+    KF_Predicted = real_result$y_hat[, tenor_index],
+    KF_GARCH_Predicted = KF_G_res$y_hat[, tenor_index]
+  )
+  
+  # Confidence intervals for KF
+  df$CI_Upper_KF <- df$KF_Predicted + 1.96 * sqrt(diag(real_result$cov_y[,,tenor_index]))
+  df$CI_Lower_KF <- df$KF_Predicted - 1.96 * sqrt(diag(real_result$cov_y[,,tenor_index]))
+
+  # Confidence intervals for KF-GARCH
+  df$CI_Upper_KF_GARCH <- df$KF_GARCH_Predicted + 1.96 * sqrt(diag(KF_G_res$cov_y[,,tenor_index]))
+  df$CI_Lower_KF_GARCH <- df$KF_GARCH_Predicted - 1.96 * sqrt(diag(KF_G_res$cov_y[,,tenor_index]))
+
+  # Create the plot
+  plot <- ggplot(df, aes(x = Time)) +
+    geom_line(aes(y = Real, color = "Real Data"), size = 1) +
+    geom_line(aes(y = KF_Predicted, color = "KF Prediction"), size = 1, linetype = "dashed") +
+    geom_line(aes(y = KF_GARCH_Predicted, color = "KF-GARCH Prediction"), size = 1, linetype = "dotted") +
+    geom_ribbon(aes(ymin = CI_Lower_KF, ymax = CI_Upper_KF, fill = "KF 95% CI"), alpha = 0.2) +
+    geom_ribbon(aes(ymin = CI_Lower_KF_GARCH, ymax = CI_Upper_KF_GARCH, fill = "KF-GARCH 95% CI"), alpha = 0.2) +
+    labs(
+      title = paste("Kalman Filter vs KF-GARCH Prediction -", tenor[tenor_index], "bond"),
+      y = "Yield",
+      x = "Time"
+    ) +
+    scale_color_manual(values = c(
+      "Real Data" = "black",
+      "KF Prediction" = "blue",
+      "KF-GARCH Prediction" = "green"
+    )) +
+    scale_fill_manual(values = c(
+      "KF 95% CI" = "blue",
+      "KF-GARCH 95% CI" = "green"
+    )) +
+    guides(
+      fill = guide_legend(title = "Confidence Interval"),
+      color = guide_legend(title = "Line")
+    ) +
+    theme_minimal()
+  
+  
+  print(plot)
+  # ggsave(filename = paste0("Prediction_", gsub(" ", "_", tenor[tenor_index]), ".png"),
+  #         plot = plot, width = 8, height = 6, dpi = 300)
+}
+
+
+```
+
+
+
+Comparison of KF and KF-GARCH state prediction & state update
+```{r}
+state_names <- c("Level", "Slope", "Curvature")
+
+for (i in 1:3) {
+  df_x <- data.frame(
+    Time = 1:n_obs,
+    KF_Predicted = real_result$xt_prediction[1:300, i],  # KF predicted x
+    KF_Filtered = real_result$xt_filter[, i],       # KF filtered x
+    KF_GARCH_Predicted = KF_G_res$xt_prediction[1:300, i],  # KF-GARCH predicted x
+    KF_GARCH_Filtered = KF_G_res$xt_filter[, i],       # KF-GARCH filtered x
+    CI_Upper_KF = real_result$xt_filter[, i] + 1.96 * sqrt(real_result$Pt_filter[i, i, ]),
+    CI_Lower_KF = real_result$xt_filter[, i] - 1.96 * sqrt(real_result$Pt_filter[i, i, ]),
+    CI_Upper_KF_GARCH = KF_G_res$xt_filter[, i] + 1.96 * sqrt(KF_G_res$Pt_filter[i, i, ]),
+    CI_Lower_KF_GARCH = KF_G_res$xt_filter[, i] - 1.96 * sqrt(KF_G_res$Pt_filter[i, i, ])
+  )
+
+  # **1. Plot for Kalman Filter (KF) Only**
+  p1 <- ggplot(df_x, aes(x = Time)) +
+    geom_line(aes(y = KF_Filtered, color = "KF Filtered"), size = 1) +
+    geom_line(aes(y = KF_Predicted, color = "KF Predicted"), size = 1, linetype = "dashed") +
+    geom_ribbon(aes(ymin = CI_Lower_KF, ymax = CI_Upper_KF), fill = "blue", alpha = 0.2) + 
+    labs(title = paste("Kalman Filter -", state_names[i]),
+         y = state_names[i],
+         x = "Time") +
+    scale_color_manual(values = c("KF Filtered" = "red", "KF Predicted" = "black")) +
+    theme_minimal()
+
+  print(p1)  # Display KF plot
+
+  # **2. Plot for KF-GARCH Only**
+  p2 <- ggplot(df_x, aes(x = Time)) +
+    geom_line(aes(y = KF_GARCH_Filtered, color = "KF-GARCH Filtered"), size = 1) +
+    geom_line(aes(y = KF_GARCH_Predicted, color = "KF-GARCH Predicted"), size = 1, linetype = "dotted") +
+    geom_ribbon(aes(ymin = CI_Lower_KF_GARCH, ymax = CI_Upper_KF_GARCH), fill = "green", alpha = 0.2) +  
+    labs(title = paste("KF-GARCH -", state_names[i]),
+         y = state_names[i],
+         x = "Time") +
+    scale_color_manual(values = c("KF-GARCH Filtered" = "blue", "KF-GARCH Predicted" = "green")) +
+    theme_minimal()
+
+  print(p2) 
+
+  p3 <- ggplot(df_x, aes(x = Time)) +
+    geom_line(aes(y = KF_Filtered, color = "KF Filtered"), size = 1) +
+    geom_line(aes(y = KF_GARCH_Filtered, color = "KF-GARCH Filtered"), size = 1, linetype = "solid") +
+    geom_ribbon(aes(ymin = CI_Lower_KF, ymax = CI_Upper_KF), fill = "blue", alpha = 0.2) +
+    geom_ribbon(aes(ymin = CI_Lower_KF_GARCH, ymax = CI_Upper_KF_GARCH), fill = "green", alpha = 0.2) +
+    labs(title = paste("Comparison: KF vs KF-GARCH -", state_names[i]),
+         y = state_names[i],
+         x = "Time") +
+    scale_color_manual(values = c("KF Filtered" = "blue", "KF-GARCH Filtered" = "green")) +
+    theme_minimal()
+
+  print(p3)  # Display Comparison plot
+}
+
+
+```
+
+
+
+
+
+
+
